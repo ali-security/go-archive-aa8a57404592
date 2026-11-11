@@ -153,6 +153,14 @@ func testBreakout(untarFn string, tmpdir string, headers []*tar.Header) error {
 			// skip file if error
 			return nil
 		}
+		// Skip symlinks to directories (such as "dir/up -> .."), which cannot
+		// be read as files; files reachable through them are covered by the
+		// walk itself and by the checks on the victim folder above.
+		if info.Type()&os.ModeSymlink != 0 {
+			if fi, err := os.Stat(path); err == nil && fi.IsDir() {
+				return nil
+			}
+		}
 		b, err := os.ReadFile(path)
 		if err != nil {
 			// Houston, we have a problem. Aborting (space)walk.

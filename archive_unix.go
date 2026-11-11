@@ -70,9 +70,13 @@ func handleTarTypeBlockCharFifo(hdr *tar.Header, path string) error {
 	return mknod(path, mode, unix.Mkdev(uint32(hdr.Devmajor), uint32(hdr.Devminor)))
 }
 
-func handleLChmod(hdr *tar.Header, path string, hdrInfo os.FileInfo) error {
+// handleLChmod applies the mode from hdrInfo to path, skipping symlinks (there
+// is no lchmod). For hardlinks, the mode is applied only when hardlinkTarget,
+// the link target as resolved within the extraction directory, is itself not
+// a symlink.
+func handleLChmod(hdr *tar.Header, path, hardlinkTarget string, hdrInfo os.FileInfo) error {
 	if hdr.Typeflag == tar.TypeLink {
-		if fi, err := os.Lstat(hdr.Linkname); err == nil && (fi.Mode()&os.ModeSymlink == 0) {
+		if fi, err := os.Lstat(hardlinkTarget); err == nil && (fi.Mode()&os.ModeSymlink == 0) {
 			if err := os.Chmod(path, hdrInfo.Mode()); err != nil {
 				return err
 			}
@@ -81,6 +85,17 @@ func handleLChmod(hdr *tar.Header, path string, hdrInfo os.FileInfo) error {
 		if err := os.Chmod(path, hdrInfo.Mode()); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// linkNoFollow creates newname as a hard link to oldname. Unlike [os.Link],
+// it never follows oldname if it is a symlink (linkat(2) without
+// AT_SYMLINK_FOLLOW): link(2) follows symlinks on some platforms, such as
+// macOS, which would allow linking to a file outside the extraction directory.
+func linkNoFollow(oldname, newname string) error {
+	if err := unix.Linkat(unix.AT_FDCWD, oldname, unix.AT_FDCWD, newname, 0); err != nil {
+		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: err}
 	}
 	return nil
 }

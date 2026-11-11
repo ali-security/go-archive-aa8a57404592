@@ -2,16 +2,12 @@ package archive
 
 import (
 	"archive/tar"
-	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
-
-	"github.com/containerd/log"
 
 	"github.com/moby/go-archive/compression"
 )
@@ -22,7 +18,9 @@ import (
 func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64, err error) {
 	tr := tar.NewReader(layer)
 
-	var dirs []*tar.Header
+	var dirs []unpackedDir
+	// unpackedPaths tracks the resolved paths already written in this layer
+	// so that the AUFS opaque-whiteout walk knows which paths to preserve.
 	unpackedPaths := make(map[string]struct{})
 
 	if options == nil {
@@ -48,35 +46,32 @@ func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64,
 
 		size += hdr.Size
 
-		// Normalize name, for safety and for a simple is-root check
-		hdr.Name = filepath.Clean(hdr.Name)
-
-		// Windows does not support filenames with colons in them. Ignore
-		// these files. This is not a problem though (although it might
-		// appear that it is). Let's suppose a client is running docker pull.
-		// The daemon it points to is Windows. Would it make sense for the
-		// client to be doing a docker pull Ubuntu for example (which has files
-		// with colons in the name under /usr/share/man/man3)? No, absolutely
-		// not as it would really only make sense that they were pulling a
-		// Windows image. However, for development, it is necessary to be able
-		// to pull Linux images which are in the repository.
+		// Normalize the name, skip entries referring to the extraction root,
+		// and reject names that escape it.
+		//
+		// Windows does not support filenames with colons in them. Such
+		// entries are ignored (see unrepresentableOnWindows). This is not a
+		// problem though (although it might appear that it is). Let's suppose
+		// a client is running docker pull. The daemon it points to is Windows.
+		// Would it make sense for the client to be doing a docker pull Ubuntu
+		// for example (which has files with colons in the name under
+		// /usr/share/man/man3)? No, absolutely not as it would really only make
+		// sense that they were pulling a Windows image. However, for
+		// development, it is necessary to be able to pull Linux images which
+		// are in the repository.
 		//
 		// TODO Windows. Once the registry is aware of what images are Windows-
 		// specific or Linux-specific, this warning should be changed to an error
 		// to cater for the situation where someone does manage to upload a Linux
 		// image but have it tagged as Windows inadvertently.
-		if runtime.GOOS == "windows" {
-			if strings.Contains(hdr.Name, ":") {
-				log.G(context.TODO()).Warnf("Windows: Ignoring %s (is this a Linux image?)", hdr.Name)
-				continue
-			}
-		}
-
-		// Ensure that the parent directory exists.
-		err = createImpliedDirectories(dest, hdr, options)
+		name, skip, err := normalizeEntryName(hdr)
 		if err != nil {
 			return 0, err
 		}
+		if skip {
+			continue
+		}
+		hdr.Name = name
 
 		// Skip AUFS metadata dirs
 		if strings.HasPrefix(hdr.Name, WhiteoutMetaPrefix) {
@@ -101,38 +96,43 @@ func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64,
 				continue
 			}
 		}
-		// #nosec G305 -- The joined path is guarded against path traversal.
-		path := filepath.Join(dest, hdr.Name)
-		rel, err := filepath.Rel(dest, path)
+
+		// Resolve symlinks in the parent directories of the entry within dest,
+		// so that links extracted from the layer cannot redirect it outside.
+		dstName, err := resolveArchivePath(dest, filepath.FromSlash(hdr.Name))
+		if err != nil {
+			return 0, err
+		}
+		// #nosec G305 -- dstName is resolved within dest by resolveArchivePath.
+		dstPath := filepath.Join(dest, dstName)
+
+		// Ensure that the parent directory exists.
+		err = createImpliedDirectories(dstPath, options)
 		if err != nil {
 			return 0, err
 		}
 
-		// Note as these operations are platform specific, so must the slash be.
-		if strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-			return 0, breakoutError(fmt.Errorf("%q is outside of %q", hdr.Name, dest))
-		}
-		base := filepath.Base(path)
+		base := filepath.Base(dstPath)
 
 		if strings.HasPrefix(base, WhiteoutPrefix) {
-			dir := filepath.Dir(path)
+			dir := filepath.Dir(dstPath)
 			if base == WhiteoutOpaqueDir {
 				_, err := os.Lstat(dir)
 				if err != nil {
 					return 0, err
 				}
-				err = filepath.WalkDir(dir, func(path string, info os.DirEntry, err error) error {
+				err = filepath.WalkDir(dir, func(p string, info os.DirEntry, err error) error {
 					if err != nil {
 						if os.IsNotExist(err) {
 							err = nil // parent was deleted
 						}
 						return err
 					}
-					if path == dir {
+					if p == dir {
 						return nil
 					}
-					if _, exists := unpackedPaths[path]; !exists {
-						return os.RemoveAll(path)
+					if _, exists := unpackedPaths[p]; !exists {
+						return os.RemoveAll(p)
 					}
 					return nil
 				})
@@ -141,19 +141,25 @@ func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64,
 				}
 			} else {
 				originalBase := base[len(WhiteoutPrefix):]
+				// A whiteout must name an entry inside dir; ".wh.", ".wh.." and
+				// ".wh..." would otherwise remove dir itself or its parent
+				// (which, for a top-level entry, is outside dest).
+				if originalBase == "" || originalBase == "." || originalBase == ".." {
+					return 0, breakoutError(fmt.Errorf("invalid whiteout entry %q", hdr.Name))
+				}
 				originalPath := filepath.Join(dir, originalBase)
 				if err := os.RemoveAll(originalPath); err != nil {
 					return 0, err
 				}
 			}
 		} else {
-			// If path exits we almost always just want to remove and replace it.
+			// If dstPath exists we almost always just want to remove and replace it.
 			// The only exception is when it is a directory *and* the file from
 			// the layer is also a directory. Then we want to merge them (i.e.
 			// just apply the metadata from the layer).
-			if fi, err := os.Lstat(path); err == nil {
+			if fi, err := os.Lstat(dstPath); err == nil {
 				if !fi.IsDir() || hdr.Typeflag != tar.TypeDir {
-					if err := os.RemoveAll(path); err != nil {
+					if err := os.RemoveAll(dstPath); err != nil {
 						return 0, err
 					}
 				}
@@ -182,23 +188,27 @@ func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64,
 				return 0, err
 			}
 
-			if err := createTarFile(path, dest, srcHdr, srcData, options); err != nil {
+			if err := createTarFile(dstPath, dest, srcHdr, srcData, options); err != nil {
 				return 0, err
 			}
 
 			// Directory mtimes must be handled at the end to avoid further
 			// file creation in them to modify the directory mtime
 			if hdr.Typeflag == tar.TypeDir {
-				dirs = append(dirs, hdr)
+				dirs = append(dirs, unpackedDir{hdr: hdr, name: dstName})
 			}
-			unpackedPaths[path] = struct{}{}
+			unpackedPaths[dstPath] = struct{}{}
 		}
 	}
 
-	for _, hdr := range dirs {
-		// #nosec G305 -- The header was checked for path traversal before it was appended to the dirs slice.
-		path := filepath.Join(dest, hdr.Name)
-		if err := chtimes(path, hdr.AccessTime, hdr.ModTime); err != nil {
+	for _, d := range dirs {
+		// Resolve the directory within dest again: entries extracted after it
+		// may have replaced it (or one of its parents) with a symlink.
+		dstPath, err := fsRootPath(dest, d.name)
+		if err != nil {
+			return 0, err
+		}
+		if err := chtimes(dstPath, d.hdr.AccessTime, d.hdr.ModTime); err != nil {
 			return 0, err
 		}
 	}

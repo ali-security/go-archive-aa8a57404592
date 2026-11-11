@@ -28,6 +28,14 @@ func TestApplyLayerInvalidFilenames(t *testing.T) {
 				Mode:     0o644,
 			},
 		},
+		{
+			{
+				// Implied parent directories must not be created outside dest.
+				Name:     "../victim/newdir/dotdot",
+				Typeflag: tar.TypeReg,
+				Mode:     0o644,
+			},
+		},
 	} {
 		if err := testBreakout("applylayer", "docker-TestApplyLayerInvalidFilenames", headers); err != nil {
 			t.Fatalf("i=%d. %v", i, err)
@@ -188,8 +196,71 @@ func TestApplyLayerInvalidSymlink(t *testing.T) {
 				Mode:     0o644,
 			},
 		},
+		{ // try writing victim/newfile (two-hop symlink chain)
+			{
+				Name:     "inner",
+				Typeflag: tar.TypeDir,
+				Mode:     0o755,
+			},
+			{
+				Name:     "inner/go_up",
+				Typeflag: tar.TypeSymlink,
+				Linkname: "..",
+			},
+			{
+				Name:     "inner/go_up/escape",
+				Typeflag: tar.TypeSymlink,
+				Linkname: "../victim",
+			},
+			{
+				Name:     "inner/go_up/escape/newfile",
+				Typeflag: tar.TypeReg,
+				Mode:     0o644,
+			},
+		},
+		{ // try reading victim/hello (two-hop symlink chain, hardlink)
+			{
+				Name:     "inner",
+				Typeflag: tar.TypeDir,
+				Mode:     0o755,
+			},
+			{
+				Name:     "inner/go_up",
+				Typeflag: tar.TypeSymlink,
+				Linkname: "..",
+			},
+			{
+				Name:     "inner/go_up/escape",
+				Typeflag: tar.TypeSymlink,
+				Linkname: "../victim",
+			},
+			{
+				Name:     "hardlink",
+				Typeflag: tar.TypeLink,
+				Linkname: "escape/hello",
+				Mode:     0o644,
+			},
+		},
 	} {
 		if err := testBreakout("applylayer", "docker-TestApplyLayerInvalidSymlink", headers); err != nil {
+			t.Fatalf("i=%d. %v", i, err)
+		}
+	}
+}
+
+// TestApplyLayerInvalidWhiteout verifies that AUFS whiteout entries cannot
+// be used to remove the parent of the extraction root (".wh..." names "..").
+func TestApplyLayerInvalidWhiteout(t *testing.T) {
+	for i, headers := range [][]*tar.Header{
+		{ // try removing the parent directory of dest, including victim
+			{
+				Name:     ".wh...",
+				Typeflag: tar.TypeReg,
+				Mode:     0o644,
+			},
+		},
+	} {
+		if err := testBreakout("applylayer", "docker-TestApplyLayerInvalidWhiteout", headers); err != nil {
 			t.Fatalf("i=%d. %v", i, err)
 		}
 	}
