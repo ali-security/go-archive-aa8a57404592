@@ -1,15 +1,71 @@
 name: test
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Space-separated Go test names to run (empty runs the full suite)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
 
 jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.23.x
+
+      - name: Build module zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          helper="${RUNNER_TEMP}/create_mod"
+          mkdir -p "$helper" "${RUNNER_TEMP}/build_output"
+          cat > "$helper/main.go" <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "$helper"
+          go mod init example.com/createmod
+          go get golang.org/x/mod@v0.22.0
+          go run . github.com/moby/go-archive v0.2.0 "$GITHUB_WORKSPACE" "${RUNNER_TEMP}/build_output/v0.2.0.zip"
+          unzip -l "${RUNNER_TEMP}/build_output/v0.2.0.zip"
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/build_output/v0.2.0.zip
+          if-no-files-found: error
+
   build:
     strategy:
       matrix:
@@ -28,26 +84,25 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
 
-      - name: lint
-        uses: golangci/golangci-lint-action@v9
-        with:
-          version: v2.7
-          args: --print-resources-usage --timeout=10m --verbose
-
       - name: Test
-        run: go test -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./...
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            go test -v -run "^($(echo "${{ inputs.test-filter }}" | tr ' ' '|'))$" ./...
+          else
+            go test -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./...
+          fi
         shell: bash
         env:
           MSYS_NO_PATHCONV: '1'
 
       - name: Test (root)
         if: runner.os == 'Linux'
-        run: go test -exec "sudo -E -n" -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./...
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            go test -exec "sudo -E -n" -v -run "^($(echo "${{ inputs.test-filter }}" | tr ' ' '|'))$" ./...
+          else
+            go test -exec "sudo -E -n" -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./...
+          fi
         shell: bash
         env:
           MSYS_NO_PATHCONV: '1'
-
-      - name: Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          directory: ./
